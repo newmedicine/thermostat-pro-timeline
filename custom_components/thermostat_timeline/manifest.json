@@ -2,12 +2,12 @@
   "domain": "thermostat_timeline",
   "name": "Thermostat Pro Timeline",
   "after_dependencies": ["lovelace"],
-  "codeowners": ["@qlerup"],
+  "codeowners": ["@newmedicine", "@qlerup"],
   "config_flow": true,
   "dependencies": ["http", "frontend"],
-  "documentation": "https://github.com/qlerup/thermostat-pro-timeline",
+  "documentation": "https://github.com/newmedicine/thermostat-pro-timeline",
   "iot_class": "local_push",
-  "issue_tracker": "https://github.com/qlerup/thermostat-pro-timeline/issues",
+  "issue_tracker": "https://github.com/newmedicine/thermostat-pro-timeline/issues",
   "requirements": [],
-  "version": "3.3.1"
+  "version": "3.3.1.post1"
 }

@@ -1,3 +1,20 @@
+# Thermostat Pro Timeline — Manual Hold Fork
+
+Maintained fork of [qlerup/thermostat-pro-timeline](https://github.com/qlerup/thermostat-pro-timeline)
+with [restart-safe manual target holds](MANUAL_TARGETS.md). The integration domain
+and stored schedules stay compatible with upstream. The upstream proposal is
+[draft PR #73](https://github.com/qlerup/thermostat-pro-timeline/pull/73).
+
+For this fork, add `newmedicine/thermostat-pro-timeline` as an Integration in
+Home Assistant Marketplace (or HACS on older versions), then install its release.
+When switching from upstream, retain the existing Thermostat Timeline integration
+entry and schedules; change the downloaded repository, not the integration domain.
+Future fork releases include the manual-target patch. Upstream releases are
+reviewed and merged before new fork releases are published; synchronization is
+not automatic. See [fork maintenance](FORK_MAINTENANCE.md).
+
+The original project's documentation and credits follow.
+
 # ❄️ Thermostat Pro Timeline — Integration + Card
 [![hacs\_badge](https://img.shields.io/badge/HACS-Default-blue.svg)](https://hacs.xyz) [![Downloads](https://img.shields.io/github/downloads/qlerup/thermostat-pro-timeline/total)](https://github.com/qlerup/thermostat-pro-timeline/releases)
 
