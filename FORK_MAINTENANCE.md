@@ -28,6 +28,10 @@ upstream changes can need a reviewed adaptation of the patch.
 ## Return to upstream
 
 Once an upstream release includes equivalent behaviour, back up Timeline's
-schedules/settings, switch the downloaded repository back to upstream, and restart
-Home Assistant. Preserve the existing config entry and domain. Generated timed
-room pauses can expire normally or be cancelled in the Timeline card.
+schedules/settings and take a full Home Assistant backup. Current Marketplace
+ownership checks require removing the Timeline setup entry before uninstalling
+the fork, installing upstream, adding Timeline again, and restarting. Keep the
+room thermostat integrations and the `thermostat_timeline` domain. The Timeline
+schedule store is retained separately from its setup entry; compare it with the
+export after migration. Generated timed room pauses can expire normally or be
+cancelled in the Timeline card.

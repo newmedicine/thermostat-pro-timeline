@@ -7,8 +7,12 @@ and stored schedules stay compatible with upstream. The upstream proposal is
 
 For this fork, add `newmedicine/thermostat-pro-timeline` as an Integration in
 Home Assistant Marketplace (or HACS on older versions), then install its release.
-When switching from upstream, retain the existing Thermostat Timeline integration
-entry and schedules; change the downloaded repository, not the integration domain.
+When switching from upstream, take a full backup and export Timeline's stored
+schedules/settings first. Current Marketplace ownership checks require removing
+the Timeline setup entry, uninstalling the old repository, installing this fork,
+then adding the Timeline integration again and restarting Home Assistant. Do not
+remove the room thermostat integrations. Timeline's domain-keyed schedule store
+is retained; verify the exported schedules/settings after the switch.
 Future fork releases include the manual-target patch. Upstream releases are
 reviewed and merged before new fork releases are published; synchronization is
 not automatic. See [fork maintenance](FORK_MAINTENANCE.md).
