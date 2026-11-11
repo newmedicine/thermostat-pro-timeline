@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 import traceback
 
-from homeassistant.core import HomeAssistant, ServiceCall, callback  # type: ignore[reportMissingImports]
+import voluptuous as vol
+
+from homeassistant.core import HomeAssistant, ServiceCall, SupportsResponse, callback  # type: ignore[reportMissingImports]
 from homeassistant.config_entries import ConfigEntry  # type: ignore[reportMissingImports]
+from homeassistant.exceptions import ServiceValidationError  # type: ignore[reportMissingImports]
 from homeassistant.helpers import config_validation as cv  # type: ignore[reportMissingImports]
 from homeassistant.helpers.storage import Store  # type: ignore[reportMissingImports]
 from homeassistant.helpers.dispatcher import async_dispatcher_send, async_dispatcher_connect  # type: ignore[reportMissingImports]
@@ -18,7 +22,7 @@ from homeassistant.helpers.event import (
     async_call_later,
 ) # type: ignore[reportMissingImports]
 from homeassistant.util import dt as dt_util  # type: ignore[reportMissingImports]
-from datetime import timedelta
+from datetime import date, timedelta
 from homeassistant.components.http import HomeAssistantView  # type: ignore[reportMissingImports]
 from homeassistant.const import UnitOfTemperature  # type: ignore[reportMissingImports]
 from typing import Any, Optional
@@ -73,6 +77,25 @@ def _c_to_f(c: float) -> float:
 
 def _f_to_c(f: float) -> float:
     return (float(f) - 32.0) * 5.0 / 9.0
+
+
+def _preserve_advances(current: dict, incoming: dict) -> dict:
+    """Keep server-owned advances when a dashboard saves an older pause map."""
+    result = {
+        eid: hold for eid, hold in incoming.items()
+        if not isinstance(hold, dict) or hold.get("source") != "advance"
+    }
+    now_ms = time.time() * 1000
+    for eid, hold in (current.items() if isinstance(current, dict) else ()):
+        if not isinstance(hold, dict) or hold.get("source") != "advance":
+            continue
+        until_ms = hold.get("until_ms")
+        replacement = result.get(eid)
+        if isinstance(until_ms, (int, float)) and until_ms > now_ms and (
+            not isinstance(replacement, dict) or replacement.get("source") == "manual_target"
+        ):
+            result[eid] = hold
+    return result
 
 
 def _dbg_write_sync(path: str, msg: str) -> None:
@@ -524,11 +547,24 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 except Exception:
                     pass
 
-        if "settings" in call.data:
-            settings = call.data.get("settings")
+        if "settings" in call.data or "room_pause_updates" in call.data:
+            settings = call.data.get("settings", {})
             if isinstance(settings, dict):
                 merged_settings = dict(cur_set)
                 merged_settings.update(settings)
+                if isinstance(settings.get("room_pause"), dict):
+                    merged_settings["room_pause"] = _preserve_advances(
+                        cur_set.get("room_pause") or {}, settings["room_pause"]
+                    )
+                updates = call.data.get("room_pause_updates")
+                if isinstance(updates, dict):
+                    pauses = dict(merged_settings.get("room_pause") or {})
+                    for room, hold in updates.items():
+                        if hold is None:
+                            pauses.pop(room, None)
+                        elif isinstance(hold, dict):
+                            pauses[room] = hold
+                    merged_settings["room_pause"] = pauses
                 try:
                     sw = merged_settings.get("boiler_switch")
                     if isinstance(sw, str) and sw:
@@ -1282,6 +1318,46 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "ThermostatTimeline frontend reload failed"
             )
 
+    def active_manager(call: ServiceCall):
+        data = hass.data[DOMAIN]
+        active_id = _norm_instance_id(data.get("active_instance_id"))
+        if "instance_id" in call.data and _norm_instance_id(call.data["instance_id"]) != active_id:
+            raise ServiceValidationError("Select this Timeline instance before using Advance.")
+        managers = data.get("manager")
+        manager = managers.get(active_id) if managers is not None else None
+        if manager is None:
+            raise ServiceValidationError("Timeline is still starting.")
+        return manager
+
+    async def advance(call: ServiceCall):
+        entity_id = call.data.get("entity_id")
+        if bool(entity_id) == call.data.get("all_rooms", False):
+            raise ServiceValidationError("Choose one room or set all_rooms to true.")
+        return {"rooms": await active_manager(call).async_advance(entity_id, call.context)}
+
+    async def cancel_advance(call: ServiceCall):
+        await active_manager(call).async_cancel_advance(call.data["entity_id"], call.context)
+
+    hass.services.async_register(
+        DOMAIN,
+        "advance",
+        advance,
+        schema=vol.Schema({
+            vol.Optional("entity_id"): cv.entity_domain("climate"),
+            vol.Optional("all_rooms"): cv.boolean,
+            vol.Optional("instance_id"): cv.string,
+        }),
+        supports_response=SupportsResponse.OPTIONAL,
+    )
+    hass.services.async_register(
+        DOMAIN,
+        "cancel_advance",
+        cancel_advance,
+        schema=vol.Schema({
+            vol.Required("entity_id"): cv.entity_domain("climate"),
+            vol.Optional("instance_id"): cv.string,
+        }),
+    )
     hass.services.async_register(DOMAIN, "set_store", set_store)
     hass.services.async_register(DOMAIN, "clear_store", clear_store)
     hass.services.async_register(DOMAIN, "factory_reset", factory_reset)
@@ -1345,6 +1421,7 @@ class AutoApplyManager:
         self._last_pause_sensor_on: bool | None = None
         self._last_applied = {}  # eid -> {"min": int, "temp": float}
         self._manual_target_lock = asyncio.Lock()
+        self._advance_write_context = None
         self._next_is_resume = False
         self._next_room_resume = None
         self._next_room_resume_at = None
@@ -1483,18 +1560,6 @@ class AutoApplyManager:
         now = dt_util.now()
         return now.hour * 60 + now.minute
 
-    def _today_key(self) -> str:
-        # Monday=0 ... Sunday=6 -> map to keys
-        idx = (dt_util.now().weekday())  # 0..6
-        return ["mon","tue","wed","thu","fri","sat","sun"][idx]
-
-    def _today_iso(self) -> str:
-        """Return today's date in HA local timezone as YYYY-MM-DD."""
-        try:
-            return dt_util.now().date().isoformat()
-        except Exception:
-            return ""
-
     def _season_key(self, settings: dict) -> str:
         try:
             return "summer" if str(settings.get("seasonal_mode") or "winter").lower().strip() == "summer" else "winter"
@@ -1536,7 +1601,7 @@ class AutoApplyManager:
         except Exception:
             return row
 
-    def _is_holiday_active(self, settings: dict) -> bool:
+    def _is_holiday_active(self, settings: dict, on_date: date | None = None) -> bool:
         """Determine whether Holiday mode is active.
 
         Uses settings written by the frontend card:
@@ -1553,8 +1618,8 @@ class AutoApplyManager:
                 dates = settings.get("holidays_dates")
                 if not isinstance(dates, list) or not dates:
                     return False
-                today = self._today_iso()
-                return any(str(d) == today for d in dates)
+                date_key = (on_date or dt_util.now().date()).isoformat()
+                return any(str(d) == date_key for d in dates)
 
             # calendar/binary_sensor entity
             eid = str(settings.get("holidays_entity") or "").strip()
@@ -1566,7 +1631,7 @@ class AutoApplyManager:
         except Exception:
             return False
 
-    def _effective_blocks_today(self, row: dict, settings: dict):
+    def _effective_blocks_today(self, row: dict, settings: dict, on_date: date | None = None):
         # Apply seasonal selection first (affects blocks/weekly/presence buckets).
         try:
             row = self._seasonal_row(row, settings)
@@ -1575,7 +1640,7 @@ class AutoApplyManager:
         # Holidays override have highest precedence when enabled and active.
         # Note: only apply holiday override when this room actually has holiday blocks.
         try:
-            if self._is_holiday_active(settings):
+            if self._is_holiday_active(settings, on_date):
                 hol = row.get("holiday") or {}
                 blk = hol.get("blocks") if isinstance(hol, dict) else None
                 if isinstance(blk, list) and len(blk) > 0:
@@ -1624,7 +1689,8 @@ class AutoApplyManager:
                 wk = row.get("weekly")
                 if wk and isinstance(wk, dict):
                     days = wk.get("days") or {}
-                    arr = days.get(self._today_key())
+                    weekday = (on_date or dt_util.now().date()).weekday()
+                    arr = days.get(("mon", "tue", "wed", "thu", "fri", "sat", "sun")[weekday])
                     if isinstance(arr, list):
                         return arr
         except Exception:
@@ -1681,7 +1747,9 @@ class AutoApplyManager:
                 out.add(e)
         return out
 
-    def _desired_for(self, eid: str, schedules: dict, settings: dict, now_min: int) -> Optional[float]:
+    def _desired_for(
+        self, eid: str, schedules: dict, settings: dict, now_min: int, *, on_date: date | None = None
+    ) -> Optional[float]:
         # Resolve primary (merged)
         merges = settings.get("merges") or {}
         primary = None
@@ -1701,8 +1769,12 @@ class AutoApplyManager:
         row = schedules.get(primary)
         if not isinstance(row, dict):
             return None
-        # Determine which blocks are effective for today
-        blocks = self._effective_blocks_today(row, settings)
+        # Without a date, use the live schedule, as on an ordinary scheduler tick.
+        blocks = (
+            self._effective_blocks_today(row, settings)
+            if on_date is None
+            else self._effective_blocks_today(row, settings, on_date)
+        )
         # Track if advanced presence is active globally and whether this room has a presence schedule for the active combo
         presence_key_active = self._active_presence_combo_key(settings)
         room_has_presence_blocks = False
@@ -2344,6 +2416,171 @@ class AutoApplyManager:
         except Exception:
             self._unsub_boiler_interval = None
     
+    def _next_temperature_change(self, eid, schedules, settings, now):
+        """Find the first future minute with a different effective target."""
+        minute = now.hour * 60 + now.minute
+        baseline = self._desired_for(eid, schedules, settings, minute, on_date=now.date())
+        if baseline is None or not math.isfinite(baseline):
+            return None
+
+        # Walk actual minutes, evaluating targets only at block edges, midnight
+        # and clock changes. This handles both missing and repeated wall times.
+        step = timedelta(minutes=1)
+        instant = dt_util.as_utc(now).replace(second=0, microsecond=0) + step
+        limit = dt_util.as_utc(now + timedelta(days=7))
+        previous_minute = minute
+        block_date = None
+        while instant <= limit:
+            local = instant.astimezone(now.tzinfo)
+            on_date = local.date()
+            minute = local.hour * 60 + local.minute
+            if block_date != on_date:
+                block_date = on_date
+                boundaries = {0}
+                for block in self._effective_blocks_today(schedules[eid], settings, on_date):
+                    for key in ("startMin", "endMin"):
+                        try:
+                            boundaries.add(int(block[key]))
+                        except (KeyError, TypeError, ValueError):
+                            continue
+            if minute in boundaries or minute != previous_minute + 1:
+                target = self._desired_for(eid, schedules, settings, minute, on_date=on_date)
+                if target is not None and math.isfinite(target) and abs(target - baseline) >= 0.05:
+                    return instant, target
+            previous_minute = minute
+            instant += step
+        return None
+
+    def _advance_window_suspended(self, eid, state):
+        owd = self._owd_mgr()
+        if hasattr(owd, "is_entity_suspended") and owd.is_entity_suspended(eid):
+            return True
+        attrs = state.attributes
+        window = attrs.get("window_manager") or attrs
+        return not window.get("is_window_bypass") and (
+            window.get("window_state") == "on" or window.get("window_auto_state") == "on"
+        )
+
+    async def _store_room_pause(self, eid, hold):
+        await self.hass.services.async_call(
+            DOMAIN, "set_store",
+            {"instance_id": self._instance_id, "activate": False,
+             "room_pause_updates": {eid: hold}},
+            blocking=True,
+        )
+
+    async def async_advance(self, eid, context):
+        """Apply the next scheduled target early to one room or all climate rooms."""
+        async with self._manual_target_lock:
+            schedules, _ = self._get_data()
+            rooms = [eid] if eid else [room for room in schedules if room.startswith("climate.")]
+            results = {}
+            for room in rooms:
+                try:
+                    results[room] = await self._async_advance_room(room, context)
+                except Exception:
+                    _LOGGER.exception("Timeline Advance failed for %s", room)
+                    results[room] = {"status": "apply_failed"}
+            return results
+
+    async def _async_advance_room(self, eid, context):
+        schedules, settings = self._get_data()
+        if not isinstance(schedules.get(eid), dict):
+            return {"status": "not_scheduled"}
+        active_instance = self.hass.data[DOMAIN].get("active_instance_id", self._instance_id)
+        if active_instance != self._instance_id or not self._auto_apply_enabled():
+            return {"status": "schedule_paused"}
+        if not (settings.get("apply_enabled") or {}).get(eid, True):
+            return {"status": "schedule_disabled"}
+        now = dt_util.now()
+        existing = (settings.get("room_pause") or {}).get(eid) or {}
+        if existing.get("indef") or float(existing.get("until_ms") or 0) > now.timestamp() * 1000:
+            if existing.get("source") == "advance":
+                return {"status": "already_advanced", "target_c": existing["target_c"],
+                        "until_ms": existing["until_ms"]}
+            if existing.get("source") != "manual_target":
+                return {"status": "room_paused"}
+
+        targets = list(dict.fromkeys([eid, *((settings.get("merges") or {}).get(eid) or [])]))
+        for target in targets:
+            state = self.hass.states.get(target)
+            if state is None or state.state in ("unknown", "unavailable"):
+                return {"status": "unavailable"}
+            if self._advance_window_suspended(target, state):
+                return {"status": "window_open"}
+
+        change = self._next_temperature_change(eid, schedules, settings, now)
+        if change is None:
+            return {"status": "no_change"}
+        until, target_c = change
+        hold = {"indef": False, "until_ms": until.timestamp() * 1000,
+                "source": "advance", "target_c": target_c}
+        await self._store_room_pause(eid, hold)
+
+        self._advance_write_context = context
+        try:
+            applied = await self._apply_setpoint(eid, target_c, advance_hold=hold, context=context)
+            if not applied:
+                await self._clear_advance(eid, hold, restore=existing)
+                return {"status": "apply_failed"}
+            failed = [
+                member for member in targets[1:]
+                if not await self._apply_setpoint(member, target_c, advance_hold=hold, context=context)
+            ]
+        finally:
+            self._advance_write_context = None
+
+        if until <= dt_util.utcnow():
+            if await self._clear_advance(eid, hold):
+                await self._apply_room_now(eid)
+            return {"status": "transition_reached"}
+        return {"status": "partial" if failed else "advanced", "target_c": target_c,
+                "until_ms": hold["until_ms"], "failed_entities": failed}
+
+    async def _clear_advance(self, eid, hold, *, restore=None):
+        """Clear this advance if it still owns the room's pause."""
+        _, settings = self._get_data()
+        pauses = settings.get("room_pause") or {}
+        if pauses.get(eid) != hold:
+            return False
+        await self._store_room_pause(eid, restore or None)
+        return True
+
+    async def async_cancel_advance(self, eid, context):
+        async with self._manual_target_lock:
+            schedules, settings = self._get_data()
+            hold = (settings.get("room_pause") or {}).get(eid) or {}
+            if hold.get("source") != "advance":
+                return
+            if hold["until_ms"] <= dt_util.utcnow().timestamp() * 1000:
+                await self._clear_advance(eid, hold)
+                return
+
+            # Keep the hold until the restore write finishes. A delayed state
+            # event for the old target could otherwise recreate a manual hold.
+            self._advance_write_context = context
+            try:
+                targets = dict.fromkeys([eid, *((settings.get("merges") or {}).get(eid) or [])])
+                for target in targets:
+                    state = self.hass.states.get(target)
+                    if (
+                        not self._auto_apply_enabled()
+                        or not (settings.get("apply_enabled") or {}).get(eid, True)
+                        or state is None or state.state in ("unknown", "unavailable")
+                        or self._advance_window_suspended(target, state)
+                    ):
+                        continue
+                    desired = self._desired_for(target, schedules, settings, self._now_min())
+                    if desired is not None and not await self._apply_setpoint(
+                        target, desired, advance_hold=hold, context=context
+                    ):
+                        if hold["until_ms"] <= dt_util.utcnow().timestamp() * 1000:
+                            break
+                        raise ServiceValidationError(f"Could not resume the schedule for {target}.")
+                await self._clear_advance(eid, hold)
+            finally:
+                self._advance_write_context = None
+
     def _manual_target_expiry(self, row, settings):
         """Expire a manual target at this room's next boundary or midnight."""
         now = dt_util.now()
@@ -2396,31 +2633,28 @@ class AutoApplyManager:
                 unit = self.hass.config.units.temperature_unit
                 if unit == UnitOfTemperature.FAHRENHEIT or "F" in str(unit).upper():
                     target_c = _f_to_c(target_c)
-                pauses = dict(settings.get("room_pause") or {})
-                existing = pauses.get(primary) or {}
-                owned = existing.get("source") == "manual_target"
+                existing = (settings.get("room_pause") or {}).get(primary) or {}
+                source = existing.get("source")
+                owned = source in ("manual_target", "advance")
                 active = bool(existing.get("indef")) or float(existing.get("until_ms") or 0) > time.time() * 1000.0
                 if active and not owned:
                     return  # Preserve pauses explicitly chosen by the user.
+                if active and source == "advance" and abs(target_c - existing["target_c"]) < 0.05:
+                    return
                 if abs(target_c - float(desired)) < 0.05:
                     if not owned:
                         return
-                    pauses.pop(primary, None)
+                    hold = None
                 else:
-                    pauses[primary] = {
+                    hold = {
                         "indef": False,
                         "until_ms": self._manual_target_expiry(row, settings),
                         "source": "manual_target",
                         "target_c": target_c,
                     }
-                await self.hass.services.async_call(
-                    DOMAIN, "set_store",
-                    {"instance_id": self._instance_id, "activate": False,
-                     "settings": {"room_pause": pauses}},
-                    blocking=True,
-                )
+                await self._store_room_pause(primary, hold)
                 _LOGGER.info("ThermostatTimeline manual target hold: %s target=%s pause=%s",
-                             primary, target_c, pauses.get(primary))
+                             primary, target_c, hold)
             except Exception:
                 _LOGGER.exception("ThermostatTimeline failed to preserve manual target for %s", eid)
 
@@ -2491,6 +2725,10 @@ class AutoApplyManager:
     
             if old_temp is not None:
                 if eid.startswith("climate.") and abs(new_temp - old_temp) >= 0.05:
+                    if self._advance_write_context is not None and (
+                        new_state.context.id == self._advance_write_context.id
+                    ):
+                        return
                     self.hass.async_create_task(self._remember_manual_target(eid, new_temp))
                 return
     
@@ -2935,7 +3173,7 @@ class AutoApplyManager:
             pass
         return False
 
-    async def _apply_setpoint(self, eid: str, desired: float) -> bool:
+    async def _apply_setpoint(self, eid: str, desired: float, *, advance_hold=None, context=None) -> bool:
         """Apply desired setpoint robustly across HVAC modes.
 
         Strategy:
@@ -3013,7 +3251,7 @@ class AutoApplyManager:
                         is_timed_active = float(until_ms) > now_ms
                     except (TypeError, ValueError):
                         is_timed_active = False
-                    if is_indef or is_timed_active:
+                    if (is_indef or is_timed_active) and (advance_hold is None or entry != advance_hold):
                         _LOGGER.debug(
                             "ThermostatTimeline apply_setpoint: SKIPPED (room_pause active) for %s (primary=%s)",
                             eid, primary_for_apply,
@@ -3069,7 +3307,9 @@ class AutoApplyManager:
                     # blocking=True so ServiceNotSupported (e.g. room thermostats
                     # that only support set_temperature) is actually caught here
                     # instead of surfacing as an unhandled error in the HA log.
-                    await self.hass.services.async_call("climate", "turn_on", {"entity_id": eid}, blocking=True)
+                    await self.hass.services.async_call(
+                        "climate", "turn_on", {"entity_id": eid}, blocking=True, **service_options
+                    )
                 except Exception:
                     return
                 try:
@@ -3111,6 +3351,28 @@ class AutoApplyManager:
             st = self.hass.states.get(eid)
             if not st:
                 return False
+
+            def can_apply_advance():
+                if advance_hold is None:
+                    return True
+                data = self.hass.data[DOMAIN]
+                _, current_settings = self._get_data()
+                current_hold = (current_settings.get("room_pause") or {}).get(primary_for_apply)
+                state = self.hass.states.get(eid)
+                return (
+                    data.get("active_instance_id", self._instance_id) == self._instance_id
+                    and self._auto_apply_enabled()
+                    and (current_settings.get("apply_enabled") or {}).get(primary_for_apply, True)
+                    and current_hold == advance_hold
+                    and advance_hold["until_ms"] > dt_util.utcnow().timestamp() * 1000
+                    and state is not None and state.state not in ("unknown", "unavailable")
+                    and not self._advance_window_suspended(eid, state)
+                )
+
+            if not can_apply_advance():
+                return False
+            service_options = {"context": context} if advance_hold is not None else {}
+            wait_for_temperature = advance_hold is not None
             # input_number support: set value directly (no HVAC modes/presets)
             if isinstance(eid, str) and eid.startswith("input_number."):
                 attrs = st.attributes or {}
@@ -3127,7 +3389,8 @@ class AutoApplyManager:
                 except Exception:
                     pass
                 await self.hass.services.async_call(
-                    "input_number", "set_value", {"entity_id": eid, "value": float(val)}, blocking=False
+                    "input_number", "set_value", {"entity_id": eid, "value": float(val)},
+                    blocking=wait_for_temperature, **service_options,
                 )
                 return True
             attrs = st.attributes or {}
@@ -3168,7 +3431,8 @@ class AutoApplyManager:
                         break
                 if want_preset and preset_mode != want_preset:
                     await self.hass.services.async_call(
-                        "climate", "set_preset_mode", {"entity_id": eid, "preset_mode": want_preset}, blocking=False
+                        "climate", "set_preset_mode", {"entity_id": eid, "preset_mode": want_preset},
+                        blocking=wait_for_temperature, **service_options,
                     )
             except Exception:
                 pass
@@ -3195,14 +3459,15 @@ class AutoApplyManager:
                         new_mode = "cool"
                     if new_mode:
                         await self.hass.services.async_call(
-                            "climate", "set_hvac_mode", {"entity_id": eid, "hvac_mode": new_mode}, blocking=False
+                            "climate", "set_hvac_mode", {"entity_id": eid, "hvac_mode": new_mode},
+                            blocking=wait_for_temperature, **service_options,
                         )
                         hvac_mode = new_mode
             except Exception:
                 pass
 
             async def _mode_after_if_needed() -> None:
-                if not (mode_ignores_setpoint and do_turn_on and turn_on_order == "after"):
+                if not (mode_ignores_setpoint and do_turn_on and turn_on_order == "after" and can_apply_advance()):
                     return
                 try:
                     new_mode = None
@@ -3212,7 +3477,8 @@ class AutoApplyManager:
                         new_mode = "cool"
                     if new_mode:
                         await self.hass.services.async_call(
-                            "climate", "set_hvac_mode", {"entity_id": eid, "hvac_mode": new_mode}, blocking=False
+                            "climate", "set_hvac_mode", {"entity_id": eid, "hvac_mode": new_mode},
+                            blocking=wait_for_temperature, **service_options,
                         )
                 except Exception:
                     pass
@@ -3244,7 +3510,11 @@ class AutoApplyManager:
                 }
                 if turn_on_order == "before":
                     await _turn_on_and_delay()
-                await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
+                if not can_apply_advance():
+                    return False
+                await self.hass.services.async_call(
+                    "climate", "set_temperature", data, blocking=wait_for_temperature, **service_options
+                )
                 await _mode_after_if_needed()
                 if turn_on_order == "after":
                     # Delay should be between set_temp and turn_on
@@ -3254,8 +3524,10 @@ class AutoApplyManager:
                     except Exception:
                         pass
                     try:
-                        if do_turn_on:
-                            await self.hass.services.async_call("climate", "turn_on", {"entity_id": eid}, blocking=True)
+                        if do_turn_on and can_apply_advance():
+                            await self.hass.services.async_call(
+                                "climate", "turn_on", {"entity_id": eid}, blocking=True, **service_options
+                            )
                     except Exception:
                         pass
                 return True
@@ -3264,7 +3536,11 @@ class AutoApplyManager:
             data = {"entity_id": eid, "temperature": float(_to_ha_from_c(_clamp_c(desired_c)))}
             if turn_on_order == "before":
                 await _turn_on_and_delay()
-            await self.hass.services.async_call("climate", "set_temperature", data, blocking=False)
+            if not can_apply_advance():
+                return False
+            await self.hass.services.async_call(
+                "climate", "set_temperature", data, blocking=wait_for_temperature, **service_options
+            )
             await _mode_after_if_needed()
             if turn_on_order == "after":
                 try:
@@ -3273,8 +3549,11 @@ class AutoApplyManager:
                 except Exception:
                     pass
                 try:
-                    if do_turn_on:
-                        await self.hass.services.async_call("climate", "turn_on", {"entity_id": eid}, blocking=False)
+                    if do_turn_on and can_apply_advance():
+                        await self.hass.services.async_call(
+                            "climate", "turn_on", {"entity_id": eid}, blocking=wait_for_temperature,
+                            **service_options,
+                        )
                 except Exception:
                     pass
             return True

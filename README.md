@@ -429,6 +429,25 @@ Utilities
 - `factory_reset`: Delete integration storage files and recreate empty (removes all instances, schedules, settings, backups).
 
 
+## Advance a room schedule
+
+Select **Advance** beside a room to use its next scheduled temperature now.
+**Advance all rooms** uses each climate room's own next target and resume time.
+Timeline looks up to seven days ahead in Home Assistant's timezone and skips
+boundaries where the effective temperature stays the same. Weekday, season,
+profile and holiday schedules follow the integration's usual precedence.
+Presence and sensor-driven overrides use their current states.
+
+The room returns to its schedule at the original change time. To end Advance
+early, open the room's pause menu and select **Resume**. An active advance
+survives a Home Assistant restart. A manual thermostat adjustment takes over
+using the ordinary manual target rules.
+
+Automations can call `thermostat_timeline.advance` with
+`data: {entity_id: climate.study}` or `data: {all_rooms: true}`. The optional
+action response contains each room's status and, when advanced, its target in
+degrees Celsius and the resume timestamp in milliseconds.
+
 ## External room sensors and device Boost mode
 
 Selecting an external room temperature sensor changes the room temperature shown

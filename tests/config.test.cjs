@@ -14,6 +14,39 @@ function card(){
   c._hasConfig=true;
   return c;
 }
+
+test('room and whole-house Advance call the same action and show per-room results', async () => {
+  const c = card();
+  const calls = [];
+  const until = Date.UTC(2026, 10, 11, 17);
+  c._config.time_12h = false;
+  c._config.labels = {'climate.room': 'Study', 'climate.other': 'Bedroom'};
+  c._render = () => {};
+  c._hass = {
+    locale: {language: 'en-GB'},
+    config: {time_zone: 'Europe/London', unit_system: {temperature: '°C'}},
+    callService: async (...args) => {
+      calls.push(args);
+      return {response: {rooms: {
+        'climate.room': {status: 'advanced', target_c: 20, until_ms: until},
+        'climate.other': {status: 'window_open'},
+      }}};
+    },
+  };
+  c._apiFetchState = async () => ({settings: {room_pause: {
+    'climate.room': {source: 'advance', until_ms: until},
+  }}});
+  await c._runAdvance('climate.room');
+  await c._runAdvance();
+  assert.equal(calls[0][0], 'thermostat_timeline');
+  assert.equal(calls[0][1], 'advance');
+  assert.equal(calls[0][2].entity_id, 'climate.room');
+  assert.equal(calls[1][2].all_rooms, true);
+  assert.equal(calls[1][5], true);
+  assert.match(c._advanceMessage, /Study · 20 °C until .*17:00/);
+  assert.match(c._advanceMessage, /Bedroom · Window detection is active/);
+  assert.equal(c._roomPauseInfo('climate.room').source, 'advance');
+});
 test('repeated HA setConfig preserves settings edited in the card',()=>{
   const c=card();
   c._config.labels={'climate.room':'Living room'};
