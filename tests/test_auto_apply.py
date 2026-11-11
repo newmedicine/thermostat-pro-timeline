@@ -12,11 +12,12 @@ from unittest.mock import AsyncMock
 source = Path(__file__).resolve().parents[1] / "custom_components/thermostat_timeline/__init__.py"
 tree = ast.parse(source.read_text(encoding="utf-8"))
 manager = next(n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "AutoApplyManager")
+future_import = next(n for n in tree.body if isinstance(n, ast.ImportFrom) and n.module == "__future__")
 namespace = dict(HomeAssistant=object, Optional=Optional, Any=Any, _norm_instance_id=lambda x:x, DOMAIN="thermostat_timeline",
     asyncio=asyncio, _LOGGER=logging.getLogger(__name__),
     UnitOfTemperature=SimpleNamespace(FAHRENHEIT="F"),
     dt_util=SimpleNamespace(utcnow=lambda:datetime.now(timezone.utc)))
-exec(compile(ast.Module(body=[manager], type_ignores=[]), str(source), "exec"), namespace)
+exec(compile(ast.Module(body=[future_import, manager], type_ignores=[]), str(source), "exec"), namespace)
 Manager = namespace["AutoApplyManager"]
 
 class AutoApplyTests(unittest.IsolatedAsyncioTestCase):
