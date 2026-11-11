@@ -1,3 +1,40 @@
+advance:
+  name: Advance schedule
+  description: Apply the next scheduled temperature change now for one room or all rooms.
+  fields:
+    entity_id:
+      name: Room
+      description: Choose one scheduled climate entity or use All rooms.
+      selector:
+        entity:
+          domain: climate
+    all_rooms:
+      name: All rooms
+      description: Advance each scheduled room to its own next target.
+      selector:
+        boolean: {}
+    instance_id:
+      name: Instance ID
+      description: Optional. Defaults to the active Timeline instance.
+      selector:
+        text: {}
+
+cancel_advance:
+  name: Resume schedule after advance
+  description: End an advance early and return the room to its current scheduled target.
+  fields:
+    entity_id:
+      name: Room
+      required: true
+      selector:
+        entity:
+          domain: climate
+    instance_id:
+      name: Instance ID
+      description: Optional. Defaults to the active Timeline instance.
+      selector:
+        text: {}
+
 set_store:
   name: Set full store
   description: Replace the entire schedules store and bump version.

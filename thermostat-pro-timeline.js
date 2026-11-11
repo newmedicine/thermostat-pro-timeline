@@ -32,6 +32,24 @@ const TT_I18N = {
     'ui.paste_plan': 'Paste plan',
     'ui.copy_day': 'Copy day',
     'ui.paste_day': 'Paste day',
+    'advance.room': 'Advance',
+    'advance.all': 'Advance all rooms',
+    'advance.save_first': 'Save your schedule edits before advancing.',
+    'advance.running': 'Applying the next scheduled target…',
+    'advance.empty': 'No climate rooms are scheduled.',
+    'advance.advanced': '{temp} until {time}',
+    'advance.already_advanced': 'Already advanced to {temp} until {time}',
+    'advance.partial': '{temp} until {time}. Some linked thermostats did not respond.',
+    'advance.schedule_paused': 'Schedule is paused or auto-apply is off',
+    'advance.schedule_disabled': 'Schedule updates are disabled',
+    'advance.room_paused': 'Room is paused',
+    'advance.window_open': 'Window detection is active',
+    'advance.unavailable': 'Thermostat is unavailable',
+    'advance.not_scheduled': 'Room has no saved schedule',
+    'advance.no_change': 'No temperature change in the next week',
+    'advance.transition_reached': 'Schedule changed while applying Advance',
+    'advance.apply_failed': 'Could not apply the scheduled temperature',
+    'advance.cancelled': 'Schedule resumed',
 
     'editor.title_label': 'Title',
     'editor.add_entity': 'Add room',
@@ -7982,7 +8000,7 @@ class ThermostatTimelineCard extends HTMLElement {
       const map = (this._config?.room_pause && typeof this._config.room_pause === 'object') ? this._config.room_pause : {};
       const entry = map[key];
       if (!entry || typeof entry !== 'object') return { indef: false, until_ms: 0 };
-      return { indef: !!entry.indef, until_ms: Number(entry.until_ms || 0) };
+      return { indef: !!entry.indef, until_ms: Number(entry.until_ms || 0), source: entry.source };
     } catch { return { indef: false, until_ms: 0 }; }
   }
   _isRoomPaused(eid){
@@ -8033,6 +8051,7 @@ class ThermostatTimelineCard extends HTMLElement {
       const key = this._roomPauseKey(eid);
       if (this._roomResumeTimers[key]) clearTimeout(this._roomResumeTimers[key]);
       const info = this._roomPauseInfo(key);
+      if (info.source === 'advance') return;
       if (info.indef) return; // manual resume only
       const when = this._roomResumeAtMs(key);
       if (!when) return;
@@ -8074,6 +8093,10 @@ class ThermostatTimelineCard extends HTMLElement {
     } catch {}
   }
   _resumeRoomNow(eid){
+    if (this._roomPauseInfo(eid).source === 'advance') {
+      this._runAdvance(this._roomPauseKey(eid), true);
+      return;
+    }
     try {
       const key = this._roomPauseKey(eid);
       const prev = (this._config.room_pause && typeof this._config.room_pause === 'object') ? this._config.room_pause : {};
@@ -8089,6 +8112,72 @@ class ThermostatTimelineCard extends HTMLElement {
       try { if (this._config?.storage_enabled) this._saveStore(); } catch {}
       try { this.shadowRoot.querySelector('.overlay-pause')?.classList.remove('open'); } catch {}
     } catch {}
+  }
+
+  _makeAdvanceButton(eid) {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'btn advance-button';
+    const label = this._t(eid ? 'advance.room' : 'advance.all');
+    button.textContent = label;
+    const room = eid && (this._config?.labels?.[eid] || this._prettyName(eid));
+    button.setAttribute('aria-label', room ? `${label} ${room}` : label);
+    const unsaved = this._pendingSaveAfterEdit || this._saving || this._storeDelayTimer;
+    button.disabled = !!(unsaved || this._advanceRunning);
+    button.title = unsaved ? this._t('advance.save_first') : button.getAttribute('aria-label');
+    button.addEventListener('click', event => {
+      event.stopPropagation();
+      this._runAdvance(eid);
+    });
+    return button;
+  }
+
+  async _runAdvance(eid, cancel = false) {
+    if (this._advanceRunning) return;
+    const instance = this._instanceId();
+    const data = eid ? { entity_id: eid } : { all_rooms: true };
+    if (this._config.instance_enabled) data.instance_id = instance;
+    this._advanceRunning = true;
+    this._advanceMessage = this._t('advance.running');
+    this._render();
+    try {
+      const result = await this._hass.callService(
+        'thermostat_timeline', cancel ? 'cancel_advance' : 'advance',
+        data, undefined, false, !cancel,
+      );
+      if (this._instanceId() !== instance) return;
+      if (cancel) {
+        this.shadowRoot.querySelector('.overlay-pause')?.classList.remove('open');
+        this._advanceMessage = this._t('advance.cancelled');
+      } else {
+        const rooms = Object.entries(result.response?.rooms || {});
+        const fmt = new Intl.DateTimeFormat(this._hass.locale?.language, {
+          weekday: 'short', hour: 'numeric', minute: '2-digit',
+          hour12: !!this._config.time_12h, timeZone: this._hass.config?.time_zone,
+        });
+        this._advanceMessage = rooms.map(([room, entry]) => {
+          const name = this._config?.labels?.[room] || this._prettyName(room);
+          let message = this._t(`advance.${entry.status}`);
+          if (entry.until_ms && Number.isFinite(entry.target_c)) {
+            const temp = this._serviceTempFromC(entry.target_c);
+            const unit = this._hass.config?.unit_system?.temperature || '°C';
+            message = message.replace('{temp}', `${temp} ${unit}`)
+              .replace('{time}', fmt.format(entry.until_ms));
+          }
+          return `${name} · ${message}`;
+        }).join('\n') || this._t('advance.empty');
+      }
+      // Refresh the holds immediately without reloading any schedule edits.
+      const state = await this._apiFetchState();
+      if (state && this._instanceId() === instance) {
+        this._config.room_pause = { ...state.settings?.room_pause };
+      }
+    } catch (err) {
+      this._advanceMessage = err?.message || this._t('advance.apply_failed');
+    } finally {
+      this._advanceRunning = false;
+      this._render();
+    }
   }
 
   _formatPauseCountdown(){
@@ -8708,6 +8797,11 @@ class ThermostatTimelineCard extends HTMLElement {
     .btn.danger{background:var(--error-color);color:var(--text-primary-color, #fff);border-color:var(--error-color)}
         .btn.ghost{background:var(--card-background-color);color:var(--primary-text-color)}
   .btn[disabled]{ opacity:.5; cursor:not-allowed }
+  .advance-bar{ display:flex; flex-wrap:wrap; align-items:center; gap:8px; padding:8px var(--pad-x); }
+  .advance-bar[hidden]{ display:none; }
+  .advance-actions{ display:flex; flex-wrap:wrap; gap:8px; }
+  .advance-status{ white-space:pre-line; font-size:.8rem; color:var(--secondary-text-color); }
+  .advance-status:empty{ display:none; }
         .track{position:relative;height:var(--row-height,64px);user-select:none;background:transparent}
         .block{position:absolute;top:6px;bottom:6px;border:1px solid var(--divider-color);border-radius:10px;background:var(--secondary-background-color, rgba(0,0,0,.05));display:flex;align-items:center;gap:10px;padding:0 10px;cursor:pointer;box-sizing:border-box}
         .block.active{outline:2px solid var(--primary-color)}
@@ -9011,6 +9105,7 @@ class ThermostatTimelineCard extends HTMLElement {
         </style>
       <ha-card class="card">
   <div class="header"><div class="title"></div><div class="weekday-full" style="display:none;"></div><div class="spacer"></div></div>
+        <div class="advance-bar" hidden><span class="advance-actions"></span><span class="advance-status" role="status"></span></div>
         <div class="scale"><div class="scale-inner"></div></div>
         <div class="rows"></div>
   <div class="footer"><div class="label-end"><span class="lbl-start">00:00</span><span class="lbl-end">00:00</span></div></div>
@@ -9994,6 +10089,20 @@ class ThermostatTimelineCard extends HTMLElement {
   const scaleEl = qs('.scale-inner');
   const headerEl = qs('.header');
     if (!rowsEl || !scaleEl || !titleEl) return;
+    const advanceEnabled = this._config.storage_enabled && !!this._hass?.services?.thermostat_timeline?.advance;
+    const advanceBar = qs('.advance-bar');
+    advanceBar.hidden = !advanceEnabled;
+    if (advanceEnabled) {
+      const actions = qs('.advance-actions');
+      actions.replaceChildren(this._makeAdvanceButton());
+      if (this._config.weekdays_enabled && this._config.weekdays_view === 'one_room_all_days') {
+        const room = this._config.weekdays_selected_room || this._config.entities?.[0];
+        if (room?.startsWith('climate.')) actions.append(this._makeAdvanceButton(room));
+      }
+      const status = qs('.advance-status');
+      const message = this._advanceMessage || '';
+      if (status.textContent !== message) status.textContent = message;
+    }
   try { this._applySeasonalModeToRows(); } catch {}
 
     // Helper: build "All rooms" / "All days" view switch
@@ -10883,6 +10992,7 @@ class ThermostatTimelineCard extends HTMLElement {
         pauseWrap.append(pauseIconBtn);
         meta.append(pauseWrap);
       } catch {}
+      if (advanceEnabled && eid.startsWith('climate.')) meta.append(this._makeAdvanceButton(eid));
 
       // (Global Away bypass button moved to header; no per-room button)
       // (manual indicator removed)
